@@ -11,7 +11,13 @@ import asyncio
 import pytest
 from serialkit import CommandTimeoutError
 
-from sony_tv_rs232 import Function, PowerState, SonyCommandError
+from sony_tv_rs232 import (
+    AnswerCode,
+    Function,
+    PowerState,
+    SonyCommandError,
+    SonyProtocolError,
+)
 
 from conftest import FakeSonyTV, FastSonyTV, make_tv, short_ack
 
@@ -53,9 +59,27 @@ async def test_non_zero_ack_raises_sony_command_error(link) -> None:
     tv = make_tv(link)
     await tv.start()
     try:
-        with pytest.raises(SonyCommandError):
+        with pytest.raises(SonyCommandError) as excinfo:
             await tv.power_on()
+        assert excinfo.value.code is AnswerCode.CANCELED
+        assert excinfo.value.function == Function.POWER.value
         assert tv.state.power is None  # rejected set did not update state
+    finally:
+        await tv.stop()
+
+
+async def test_query_short_ack_raises_protocol_error_not_indexerror(
+    link,
+) -> None:
+    """A TV that acks a query with a bare (data-less) COMPLETED reply must
+    surface a SonyProtocolError, not a raw IndexError, so the coordinator's
+    ProtocolError catch handles it."""
+    FakeSonyTV(link)  # unscripted queries get a data-less short ack
+    tv = make_tv(link)
+    await tv.start()
+    try:
+        with pytest.raises(SonyProtocolError):
+            await tv.query_volume()
     finally:
         await tv.stop()
 
