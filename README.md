@@ -1,7 +1,7 @@
 # sony-tv-rs232
 
 Async Python library to control Sony Bravia TVs over RS232 serial, built on
-[serialkit](https://github.com/home-assistant-libs/serialkit) and
+[serialkit](https://github.com/bbangert/serialkit) and
 [serialx](https://github.com/puddly/serialx).
 
 ## Installation

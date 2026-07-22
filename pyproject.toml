@@ -31,7 +31,7 @@ esphome = ["serialx[esphome]>=1.8.2"]
 sony-tv-rs232 = "sony_tv_rs232.__main__:main"
 
 [project.urls]
-Repository = "https://github.com/home-assistant-libs/sony-tv-rs232"
+Repository = "https://github.com/bbangert/sony-tv-rs232"
 
 [build-system]
 requires = ["uv_build>=0.8.4,<0.9.0"]
