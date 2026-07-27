@@ -2,21 +2,20 @@
 
 The robustness machinery (framing, request/response correlation, pacing,
 reconnect, the read loop) lives in :class:`serialkit.SerialDevice`. This module
-is just the Sony command surface plus the wiring that configures the runtime.
+is the Sony command surface plus the wiring that configures the runtime.
 
-Migration note (fixes the production desync): correlation is no longer the
-positional ``pending.pop(0)`` FIFO — Sony answers carry no identifying content,
-so the driver serializes with ``max_in_flight = 1`` (one command owed a reply
-at a time) and lets serialkit's slot gate + write-abandon guarantee that a
-dropped or garbled answer can never shift correlation onto the next command.
-The hand-rolled 500 ms sleeps, read loop, teardown, and pending list are gone.
+Sony answer frames carry no identifying content, so responses cannot be
+correlated by content. Commands are therefore serialized with
+``max_in_flight = 1`` (one command owed a reply at a time); serialkit's slot
+gate and write-abandon then guarantee that a dropped or garbled answer times
+its command out rather than being misattributed to the next one.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import serialx
 
@@ -63,28 +62,43 @@ _T = TypeVar("_T")
 
 StateCallback = Callable[[TVState | None], None]
 
+
+def _parse_power(data: bytes) -> PowerState:
+    if data == b"\x00":
+        return PowerState.OFF
+    if data == b"\x01":
+        return PowerState.ON
+    raise ValueError(f"Unknown power data: {data!r}")
+
+
+# Function -> (state attribute, decoder mapping reply data to the value). Reply
+# data mirrors the Set shape: most values sit at data[1] behind the 0x01
+# "Direct" marker; Power/Input/CineMotion/AdvancedIris carry the value(s) at
+# data[0], and Treble/Bass at data[2]. query_state() walks these functions.
+_QUERY_DECODERS: dict[Function, tuple[str, Callable[[bytes], object]]] = {
+    Function.POWER: ("power", _parse_power),
+    Function.INPUT_SELECT: ("input_source", lambda d: InputSource(tuple(d))),
+    Function.VOLUME: ("volume", lambda d: byte_to_percent(d[1])),
+    Function.AUDIO_MUTE: ("audio_mute", lambda d: d[1] == 0x01),
+    Function.PICTURE_MODE: ("picture_mode", lambda d: PictureMode(d[1])),
+    Function.PICTURE: ("picture_level", lambda d: byte_to_percent(d[1])),
+    Function.BRIGHTNESS: ("brightness", lambda d: byte_to_percent(d[1])),
+    Function.COLOR: ("color", lambda d: byte_to_percent(d[1])),
+    Function.SHARPNESS: ("sharpness", lambda d: byte_to_percent(d[1])),
+    Function.CINE_MOTION: ("cine_motion", lambda d: CineMotion(d[0])),
+    Function.ADVANCED_IRIS: ("advanced_iris", lambda d: AdvancedIris(d[0])),
+    Function.SOUND_MODE: ("sound_mode", lambda d: SoundMode(d[1])),
+    Function.TREBLE: ("treble", lambda d: byte_to_percent(d[2])),
+    Function.BASS: ("bass", lambda d: byte_to_percent(d[2])),
+    Function.SPEAKER_OFF: ("speaker_off", lambda d: d[1] == 0x01),
+    Function.WIDE_MODE: ("wide_mode", lambda d: WideMode(d[1])),
+    Function.MODE_4_3: ("mode_4_3", lambda d: Mode4_3(d[1])),
+    Function.OFF_TIMER: ("off_timer", lambda d: OffTimer(d[1])),
+}
+
 # Functions worth polling in query_state(); consumer Bravias ignore them all
 # and each simply times out (best effort).
-_QUERYABLE: tuple[Function, ...] = (
-    Function.POWER,
-    Function.INPUT_SELECT,
-    Function.VOLUME,
-    Function.AUDIO_MUTE,
-    Function.PICTURE_MODE,
-    Function.PICTURE,
-    Function.BRIGHTNESS,
-    Function.COLOR,
-    Function.SHARPNESS,
-    Function.CINE_MOTION,
-    Function.ADVANCED_IRIS,
-    Function.SOUND_MODE,
-    Function.TREBLE,
-    Function.BASS,
-    Function.SPEAKER_OFF,
-    Function.WIDE_MODE,
-    Function.MODE_4_3,
-    Function.OFF_TIMER,
-)
+_QUERYABLE: tuple[Function, ...] = tuple(_QUERY_DECODERS)
 
 
 def _is_answer(frame: bytes) -> bool:
@@ -122,9 +136,7 @@ class SonyTV(SerialDevice[TVState]):
         # unanswered (consumer sets are set-only). None until first probed.
         self._supports_queries: bool | None = None
 
-    async def _open_connection(
-        self,
-    ) -> tuple[object, object]:
+    async def _open_connection(self) -> tuple[object, object]:
         return await serialx.open_serial_connection(self._port, baudrate=BAUD_RATE)
 
     @property
@@ -156,9 +168,7 @@ class SonyTV(SerialDevice[TVState]):
             power = await self.query_power()
         except (CommandTimeoutError, ProtocolError) as err:
             self._supports_queries = False
-            _LOGGER.debug(
-                "TV did not answer a power query (%s); set-only mode", err
-            )
+            _LOGGER.debug("TV did not answer a power query (%s); set-only mode", err)
             return
         self._supports_queries = True
         if power is PowerState.ON:
@@ -196,9 +206,7 @@ class SonyTV(SerialDevice[TVState]):
                 try:
                     await self._query(function)
                 except (CommandTimeoutError, ProtocolError) as err:
-                    _LOGGER.debug(
-                        "Skipping query for %s: %s", function.name, err
-                    )
+                    _LOGGER.debug("Skipping query for %s: %s", function.name, err)
 
     # -- Power ---------------------------------------------------------------
 
@@ -216,7 +224,7 @@ class SonyTV(SerialDevice[TVState]):
 
     async def query_power(self) -> PowerState:
         """Query the TV's power state (community query format)."""
-        return self._decode(await self._query(Function.POWER), self._parse_power)
+        return await self._query(Function.POWER)
 
     async def enable_standby_listening(self) -> None:
         """Allow the TV to accept Power ON commands while in standby.
@@ -242,10 +250,7 @@ class SonyTV(SerialDevice[TVState]):
         await self._set(Function.INPUT_SELECT, bytes(InputSource.TOGGLE.value))
 
     async def query_input_source(self) -> InputSource:
-        return self._decode(
-            await self._query(Function.INPUT_SELECT),
-            lambda d: InputSource(tuple(d)),
-        )
+        return await self._query(Function.INPUT_SELECT)
 
     # -- Volume / mute -------------------------------------------------------
 
@@ -261,11 +266,7 @@ class SonyTV(SerialDevice[TVState]):
         await self._set(Function.VOLUME, bytes([0x00, 0x01]))
 
     async def query_volume(self) -> int:
-        # Reply data echoes the Set shape: [Direct=0x01, value]
-        return self._decode(
-            await self._query(Function.VOLUME),
-            lambda d: byte_to_percent(d[1]),
-        )
+        return await self._query(Function.VOLUME)
 
     async def mute_on(self) -> None:
         await self._set(Function.AUDIO_MUTE, bytes([0x01, 0x01]))
@@ -280,11 +281,7 @@ class SonyTV(SerialDevice[TVState]):
 
     async def query_mute(self) -> bool:
         """Query mute. Returns True when audio is muted."""
-        # Reply data echoes the Set shape: [Direct=0x01, mute_flag]
-        return self._decode(
-            await self._query(Function.AUDIO_MUTE),
-            lambda d: d[1] == 0x01,
-        )
+        return await self._query(Function.AUDIO_MUTE)
 
     # -- Picture controls (all 0..100) --------------------------------------
 
@@ -294,28 +291,21 @@ class SonyTV(SerialDevice[TVState]):
         self._apply("picture_level", percent)
 
     async def query_picture_level(self) -> int:
-        return self._decode(
-            await self._query(Function.PICTURE), lambda d: byte_to_percent(d[1])
-        )
+        return await self._query(Function.PICTURE)
 
     async def set_brightness(self, percent: int) -> None:
         await self._set(Function.BRIGHTNESS, bytes([0x01, percent_to_byte(percent)]))
         self._apply("brightness", percent)
 
     async def query_brightness(self) -> int:
-        return self._decode(
-            await self._query(Function.BRIGHTNESS),
-            lambda d: byte_to_percent(d[1]),
-        )
+        return await self._query(Function.BRIGHTNESS)
 
     async def set_color(self, percent: int) -> None:
         await self._set(Function.COLOR, bytes([0x01, percent_to_byte(percent)]))
         self._apply("color", percent)
 
     async def query_color(self) -> int:
-        return self._decode(
-            await self._query(Function.COLOR), lambda d: byte_to_percent(d[1])
-        )
+        return await self._query(Function.COLOR)
 
     async def set_hue(self, red: int, green: int) -> None:
         """Set hue. Sony exposes both red-bias and green-bias on a 0..100 scale."""
@@ -329,9 +319,7 @@ class SonyTV(SerialDevice[TVState]):
         self._apply("sharpness", percent)
 
     async def query_sharpness(self) -> int:
-        return self._decode(
-            await self._query(Function.SHARPNESS), lambda d: byte_to_percent(d[1])
-        )
+        return await self._query(Function.SHARPNESS)
 
     # -- Audio controls ------------------------------------------------------
 
@@ -360,18 +348,14 @@ class SonyTV(SerialDevice[TVState]):
         self._apply("picture_mode", mode)
 
     async def query_picture_mode(self) -> PictureMode:
-        return self._decode(
-            await self._query(Function.PICTURE_MODE), lambda d: PictureMode(d[1])
-        )
+        return await self._query(Function.PICTURE_MODE)
 
     async def set_sound_mode(self, mode: SoundMode) -> None:
         await self._set(Function.SOUND_MODE, bytes([0x01, mode.value]))
         self._apply("sound_mode", mode)
 
     async def query_sound_mode(self) -> SoundMode:
-        return self._decode(
-            await self._query(Function.SOUND_MODE), lambda d: SoundMode(d[1])
-        )
+        return await self._query(Function.SOUND_MODE)
 
     async def set_cine_motion(self, mode: CineMotion) -> None:
         await self._set(Function.CINE_MOTION, bytes([mode.value]))
@@ -387,9 +371,7 @@ class SonyTV(SerialDevice[TVState]):
         self._apply("wide_mode", mode)
 
     async def query_wide_mode(self) -> WideMode:
-        return self._decode(
-            await self._query(Function.WIDE_MODE), lambda d: WideMode(d[1])
-        )
+        return await self._query(Function.WIDE_MODE)
 
     async def set_4_3_mode(self, mode: Mode4_3) -> None:
         await self._set(Function.MODE_4_3, bytes([0x01, mode.value]))
@@ -423,14 +405,20 @@ class SonyTV(SerialDevice[TVState]):
         answer.raise_for_status(function.value)
         return answer
 
-    async def _query(self, function: Function) -> Answer:
-        """Send a Query packet, wait for the reply, and update state from it."""
+    async def _query(self, function: Function) -> Any:
+        """Query the TV, decode the reply via the table, update state, return it.
+
+        Raises SonyProtocolError if the reply can't be decoded (e.g. a
+        data-less ack from a set-only TV), which query_state() and the connect
+        handshake treat as "unanswered".
+        """
         frame = await self.request(encode_query(function.value), _is_answer)
         answer = parse_answer(frame)
         answer.raise_for_status(function.value)
-        if answer.data:
-            self._apply_query(function, answer)
-        return answer
+        attr, decoder = _QUERY_DECODERS[function]
+        value = self._decode(answer, decoder)
+        self._apply(attr, value)
+        return value
 
     def _apply(self, attr: str, value: object) -> None:
         """Mutate one state field on the caller task and notify on change."""
@@ -438,59 +426,6 @@ class SonyTV(SerialDevice[TVState]):
             return
         setattr(self.state, attr, value)
         self.notify()
-
-    def _apply_query(self, function: Function, answer: Answer) -> None:
-        """Update ``state`` from a successful query reply.
-
-        Reply data mirrors the corresponding Set command: functions whose Set
-        begins with the Direct marker ``0x01`` echo it back (value at
-        ``data[1]``); Power/Input/CineMotion carry the value(s) at ``data[0]``.
-        """
-        data = answer.data
-        try:
-            if function is Function.POWER:
-                self._apply("power", self._parse_power(data))
-            elif function is Function.INPUT_SELECT:
-                self._apply("input_source", InputSource(tuple(data)))
-            elif function is Function.VOLUME:
-                self._apply("volume", byte_to_percent(data[1]))
-            elif function is Function.AUDIO_MUTE:
-                self._apply("audio_mute", data[1] == 0x01)
-            elif function is Function.PICTURE_MODE:
-                self._apply("picture_mode", PictureMode(data[1]))
-            elif function is Function.PICTURE:
-                self._apply("picture_level", byte_to_percent(data[1]))
-            elif function is Function.BRIGHTNESS:
-                self._apply("brightness", byte_to_percent(data[1]))
-            elif function is Function.COLOR:
-                self._apply("color", byte_to_percent(data[1]))
-            elif function is Function.SHARPNESS:
-                self._apply("sharpness", byte_to_percent(data[1]))
-            elif function is Function.CINE_MOTION:
-                self._apply("cine_motion", CineMotion(data[0]))
-            elif function is Function.ADVANCED_IRIS:
-                self._apply("advanced_iris", AdvancedIris(data[0]))
-            elif function is Function.SOUND_MODE:
-                self._apply("sound_mode", SoundMode(data[1]))
-            elif function is Function.TREBLE:
-                self._apply("treble", byte_to_percent(data[2]))
-            elif function is Function.BASS:
-                self._apply("bass", byte_to_percent(data[2]))
-            elif function is Function.SPEAKER_OFF:
-                self._apply("speaker_off", data[1] == 0x01)
-            elif function is Function.WIDE_MODE:
-                self._apply("wide_mode", WideMode(data[1]))
-            elif function is Function.MODE_4_3:
-                self._apply("mode_4_3", Mode4_3(data[1]))
-            elif function is Function.OFF_TIMER:
-                self._apply("off_timer", OffTimer(data[1]))
-        except (ValueError, KeyError, IndexError) as err:
-            _LOGGER.debug(
-                "Could not parse query data %s for %s: %s",
-                data.hex(" "),
-                function.name,
-                err,
-            )
 
     @staticmethod
     def _decode(answer: Answer, decoder: Callable[[bytes], _T]) -> _T:
@@ -504,11 +439,3 @@ class SonyTV(SerialDevice[TVState]):
             raise SonyProtocolError(
                 f"could not decode query reply {answer.data.hex(' ')!r}: {err}"
             ) from err
-
-    @staticmethod
-    def _parse_power(data: bytes) -> PowerState:
-        if data == b"\x00":
-            return PowerState.OFF
-        if data == b"\x01":
-            return PowerState.ON
-        raise ValueError(f"Unknown power data: {data!r}")

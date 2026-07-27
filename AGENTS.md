@@ -57,4 +57,5 @@ one file changes (`from serialkit import ...` → `from ..serialkit import ...`)
 `pytest` with `pytest-asyncio`, `asyncio_mode = "auto"`; no real hardware.
 `FakeSonyTV` (tests/conftest.py) decodes written packets and scripts answers.
 Run under Python 3.14 (`uv run --python 3.14 pytest`); serialkit is resolved
-from the sibling repo via `[tool.uv.sources]` until it is published to PyPI.
+from PyPI, where it is published as the `serial-toolkit` distribution (the
+import package stays `serialkit`).

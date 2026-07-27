@@ -7,14 +7,13 @@ express, because the frame boundary is decided by the protocol checksum:
     Long (query reply): [0x70][status][size][data...][cs]  — byte 2 is length
 
 There is no length byte in the short form (byte 2 is the checksum), so a
-``LengthPrefixedFramer`` would misread every Set ack. The only way to tell the
-shapes apart is the checksum trick the driver has always used: in a short
-packet byte 2 must equal ``(0x70 + status) & 0xFF``.
+``LengthPrefixedFramer`` would misread every Set ack. The shapes are told apart
+by checksum: in a short packet byte 2 must equal ``(0x70 + status) & 0xFF``.
 
-This framer owns the residual buffer (fixing the old ``readexactly`` read loop
-that lost partial bytes on cancel) and, crucially, resyncs on a checksum-invalid
-long candidate by rescanning from ``start + 1`` instead of trusting the size
-byte and swallowing the following real frames (the old defect at tv.py:487-495).
+The framer owns the residual buffer and resyncs on a checksum-invalid long
+candidate by rescanning from ``start + 1`` rather than trusting the size byte
+(which could otherwise swallow the following frames). ``max_frame`` bounds the
+resync so a corrupted size byte cannot park it waiting for a phantom frame.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ class SonyAnswerFramer:
         # Sony frames are tiny (3 bytes to ~8); a long run with no valid frame
         # is garbage, so a small max_frame bounds the resync and prevents a
         # corrupted size byte from parking the framer waiting for a phantom
-        # long frame (the old read loop's swallow-the-next-frames bug).
+        # long frame.
         self._max_frame = max_frame
         self._buffer = bytearray()
 
@@ -71,8 +70,7 @@ class SonyAnswerFramer:
             total = 3 + b2
             if total > self._max_frame:
                 exc = ResyncError(
-                    f"long frame of {total} bytes exceeds max_frame="
-                    f"{self._max_frame}",
+                    f"long frame of {total} bytes exceeds max_frame={self._max_frame}",
                     frames=frames,
                 )
                 self._buffer.clear()

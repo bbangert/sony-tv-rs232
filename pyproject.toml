@@ -10,7 +10,9 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "serialx>=1.8.2",
-    "serialkit>=0.1.0",
+    # The distribution is "serial-toolkit"; the import package is `serialkit`
+    # (PyPI blocks the name "serialkit").
+    "serial-toolkit>=0.1.2",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -31,7 +33,7 @@ esphome = ["serialx[esphome]>=1.8.2"]
 sony-tv-rs232 = "sony_tv_rs232.__main__:main"
 
 [project.urls]
-Repository = "https://github.com/bbangert/sony-tv-rs232"
+Repository = "https://github.com/home-assistant-libs/sony-tv-rs232"
 
 [build-system]
 requires = ["uv_build>=0.8.4,<0.9.0"]
@@ -43,11 +45,6 @@ dev = [
     "pytest-asyncio>=1.0",
     "pytest-timeout>=2.4.0",
 ]
-
-# serialkit is not yet published to PyPI; during development resolve it from
-# the sibling repo in this workspace. Drop this once serialkit 0.1.0 is on PyPI.
-[tool.uv.sources]
-serialkit = { path = "../../serialkit", editable = true }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

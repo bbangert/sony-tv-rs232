@@ -30,7 +30,7 @@ def test_long_query_reply_frame() -> None:
 def test_frame_split_across_chunks() -> None:
     framer = SonyAnswerFramer()
     reply = long_reply(b"\x01\x32")  # volume reply shape
-    assert framer.feed(reply[:2]) == []      # partial header
+    assert framer.feed(reply[:2]) == []  # partial header
     assert framer.feed(reply[2:]) == [reply]
 
 
@@ -54,9 +54,9 @@ def test_garbled_short_ack_rescans_and_recovers() -> None:
     than trusting the bogus size and swallowing the following real frame."""
     framer = SonyAnswerFramer()
     garbled = bytes([0x70, 0x00, 0x05, 0x11, 0x22, 0x33, 0x44, 0x99])
-    assert framer.feed(garbled) == []          # rescanned away, no frame
+    assert framer.feed(garbled) == []  # rescanned away, no frame
     ack = short_ack()
-    assert framer.feed(ack) == [ack]           # framer not wedged
+    assert framer.feed(ack) == [ack]  # framer not wedged
 
 
 def test_oversize_long_candidate_resyncs() -> None:

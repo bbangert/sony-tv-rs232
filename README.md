@@ -21,6 +21,7 @@ Requires Python 3.14+.
 import asyncio
 from sony_tv_rs232 import SonyTV, InputSource
 
+
 async def main():
     tv = SonyTV("/dev/ttyUSB0")
     await tv.connect()
@@ -31,6 +32,7 @@ async def main():
     await tv.select_input_source(InputSource.HDMI1)
 
     await tv.disconnect()
+
 
 asyncio.run(main())
 ```
@@ -70,11 +72,11 @@ from sony_tv_rs232 import CommandTimeoutError, ConnectionLostError, SonyCommandE
 
 try:
     await tv.set_volume(50)
-except SonyCommandError as err:      # TV returned a non-zero answer code
+except SonyCommandError as err:  # TV returned a non-zero answer code
     ...
-except CommandTimeoutError:          # no answer in time (common on set-only TVs)
+except CommandTimeoutError:  # no answer in time (common on set-only TVs)
     ...
-except ConnectionLostError:          # serial link dropped
+except ConnectionLostError:  # serial link dropped
     ...
 ```
 

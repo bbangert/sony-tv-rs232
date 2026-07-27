@@ -117,7 +117,9 @@ async def _diagnose(port: str) -> int:
             pass
 
     if received:
-        print(f"[diag] Got {len(received)} chunks; total {sum(len(c) for c in received)} bytes")
+        print(
+            f"[diag] Got {len(received)} chunks; total {sum(len(c) for c in received)} bytes"
+        )
         return 0
     print(
         "[diag] Nothing received. Most likely the TV is fully off, the RX line is "
