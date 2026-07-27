@@ -18,9 +18,10 @@ resync so a corrupted size byte cannot park it waiting for a phantom frame.
 
 from __future__ import annotations
 
+from serialkit import ResyncError
+
 from .const import HEADER_ANSWER
 from .protocol import checksum
-from ._kit import ResyncError
 
 
 class SonyAnswerFramer:

@@ -1,11 +1,12 @@
 """Async library to control Sony Bravia TVs over RS232, built on serialkit."""
 
-from ._kit import (
+from serialkit import (
     CommandTimeoutError,
     ConnectionLostError,
     ProtocolError,
     SerialKitError,
 )
+
 from .const import (
     BAUD_RATE,
     CATEGORY,
@@ -48,27 +49,27 @@ from .state import TVState
 from .tv import SonyTV, StateCallback
 
 __all__ = [
-    "AdvancedIris",
-    "Answer",
-    "AnswerCode",
     "BAUD_RATE",
     "CATEGORY",
     "COMMAND_TIMEOUT",
+    "HEADER_ANSWER",
+    "HEADER_CONTROL",
+    "HEADER_INQUIRY",
+    "INTER_COMMAND_DELAY",
+    "MAX_PERCENT",
+    "MAX_VOLUME",
+    "MIN_PERCENT",
+    "MIN_VOLUME",
+    "AdvancedIris",
+    "Answer",
+    "AnswerCode",
     "CineMotion",
     "ClosedCaption",
     "CommandTimeoutError",
     "ConnectionLostError",
     "Function",
-    "HEADER_ANSWER",
-    "HEADER_CONTROL",
-    "HEADER_INQUIRY",
-    "INTER_COMMAND_DELAY",
     "InputSource",
     "Language",
-    "MAX_PERCENT",
-    "MAX_VOLUME",
-    "MIN_PERCENT",
-    "MIN_VOLUME",
     "Mode4_3",
     "OffTimer",
     "PictureMode",

@@ -7,11 +7,10 @@ cannot express)."""
 from __future__ import annotations
 
 import pytest
+from conftest import long_reply, short_ack
 from serialkit import ResyncError
 
 from sony_tv_rs232 import SonyAnswerFramer
-
-from conftest import long_reply, short_ack
 
 
 def test_short_ack_frame() -> None:

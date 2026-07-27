@@ -8,7 +8,7 @@ the driver can be exercised end-to-end (handshake, queries, sets).
 from __future__ import annotations
 
 import pytest
-from serialkit import Backoff, Pacing
+from serialkit import Backoff
 from serialkit.testing import FakeLink
 
 from sony_tv_rs232 import SonyTV
@@ -28,16 +28,11 @@ def long_reply(data: bytes, code: int = 0x00) -> bytes:
     return body + bytes([checksum(body)])
 
 
-class FastSonyTV(SonyTV):
-    """SonyTV with pacing, timeouts, and backoff shrunk so tests run fast."""
-
-    pacing = Pacing(min_interval=0.0)
-    request_timeout = 0.2
-    backoff = Backoff(initial=0.01, factor=1.0, max_delay=0.01)
+FAST_BACKOFF = Backoff(initial=0.01, factor=1.0, max_delay=0.01)
 
 
-class NoHandshakeSonyTV(FastSonyTV):
-    """FastSonyTV that skips the on_connect handshake (for command-level tests)."""
+class NoHandshakeSonyTV(SonyTV):
+    """SonyTV that skips the on_connect handshake (for command-level tests)."""
 
     async def on_connect(self) -> None:
         return
@@ -79,7 +74,12 @@ def link() -> FakeLink:
 
 
 def make_tv(link: FakeLink, cls: type[SonyTV] = NoHandshakeSonyTV) -> SonyTV:
-    """Build a SonyTV wired to the fake transport."""
-    tv = cls("mock://test")
-    tv._connect = link.connect  # inject the fake transport factory
-    return tv
+    """Build a SonyTV on the fake transport, with pacing and timeouts shrunk
+    so the suite runs in milliseconds rather than seconds."""
+    return cls(
+        "mock://test",
+        connect=link.connect,
+        command_timeout=0.2,
+        inter_command_delay=0.0,
+        backoff=FAST_BACKOFF,
+    )

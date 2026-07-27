@@ -1,14 +1,15 @@
 """SonyTV driver behaviour on serialkit.testing.
 
-Covers the headline desync fix (a garbled/dropped answer must never shift
-correlation onto the next command), set/query round-trips, error mapping, the
-connect handshake, and reconnect."""
+Covers the headline desync fix (a garbled/dropped answer must never be read
+as the next command's), set/query round-trips, error mapping, the connect
+handshake, and reconnect."""
 
 from __future__ import annotations
 
 import asyncio
 
 import pytest
+from conftest import FakeSonyTV, make_tv, short_ack
 from serialkit import CommandTimeoutError
 
 from sony_tv_rs232 import (
@@ -17,10 +18,8 @@ from sony_tv_rs232 import (
     PowerState,
     SonyCommandError,
     SonyProtocolError,
+    SonyTV,
 )
-
-from conftest import FakeSonyTV, FastSonyTV, make_tv, short_ack
-
 
 # ---- set / query round-trips -------------------------------------------
 
@@ -30,7 +29,7 @@ async def test_set_updates_state_and_notifies(link) -> None:
     tv = make_tv(link)
     snapshots: list = []
     tv.subscribe(snapshots.append)
-    await tv.start()
+    await tv.connect()
     try:
         await asyncio.sleep(0)  # flush the initial snapshot
         await tv.set_volume(42)
@@ -38,18 +37,18 @@ async def test_set_updates_state_and_notifies(link) -> None:
         await asyncio.sleep(0)  # let the coalesced notify flush
         assert snapshots[-1].volume == 42  # subscriber saw the change
     finally:
-        await tv.stop()
+        await tv.disconnect()
 
 
 async def test_query_returns_value_and_updates_state(link) -> None:
     FakeSonyTV(link, query_data={Function.VOLUME.value: b"\x01\x1e"})  # 0x1e = 30
     tv = make_tv(link)
-    await tv.start()
+    await tv.connect()
     try:
         assert await tv.query_volume() == 30
         assert tv.state.volume == 30
     finally:
-        await tv.stop()
+        await tv.disconnect()
 
 
 async def test_non_zero_ack_raises_sony_command_error(link) -> None:
@@ -58,7 +57,7 @@ async def test_non_zero_ack_raises_sony_command_error(link) -> None:
 
     link.on_write = reject
     tv = make_tv(link)
-    await tv.start()
+    await tv.connect()
     try:
         with pytest.raises(SonyCommandError) as excinfo:
             await tv.power_on()
@@ -66,7 +65,7 @@ async def test_non_zero_ack_raises_sony_command_error(link) -> None:
         assert excinfo.value.function == Function.POWER.value
         assert tv.state.power is None  # rejected set did not update state
     finally:
-        await tv.stop()
+        await tv.disconnect()
 
 
 async def test_query_short_ack_raises_protocol_error_not_indexerror(
@@ -77,12 +76,12 @@ async def test_query_short_ack_raises_protocol_error_not_indexerror(
     ProtocolError catch handles it."""
     FakeSonyTV(link)  # unscripted queries get a data-less short ack
     tv = make_tv(link)
-    await tv.start()
+    await tv.connect()
     try:
         with pytest.raises(SonyProtocolError):
             await tv.query_volume()
     finally:
-        await tv.stop()
+        await tv.disconnect()
 
 
 # ---- the headline fix: no correlation shift on a lost answer -----------
@@ -90,10 +89,10 @@ async def test_query_short_ack_raises_protocol_error_not_indexerror(
 
 async def test_garbled_answer_does_not_shift_correlation(link) -> None:
     """The production desync: a dropped/garbled answer to command A must not
-    resolve command B. max_in_flight=1 keeps B off the wire until A completes,
-    and the framer rescans the garble away instead of misframing."""
+    resolve command B. The exchange holds the wire, so B stays off it until A
+    finishes, and the framer rescans the garble away instead of misframing."""
     tv = make_tv(link)
-    await tv.start()
+    await tv.connect()
     try:
         a = asyncio.ensure_future(tv.set_volume(50))
         await asyncio.sleep(0.01)
@@ -119,7 +118,7 @@ async def test_garbled_answer_does_not_shift_correlation(link) -> None:
         assert tv.state.volume is None  # A never misattributed B's answer
         assert link.connects == 1  # no reconnect churn
     finally:
-        await tv.stop()
+        await tv.disconnect()
 
 
 # ---- connect handshake -------------------------------------------------
@@ -127,22 +126,22 @@ async def test_garbled_answer_does_not_shift_correlation(link) -> None:
 
 async def test_handshake_marks_supports_queries_when_answered(link) -> None:
     FakeSonyTV(link, query_data={Function.POWER.value: b"\x00"})  # power OFF
-    tv = make_tv(link, cls=FastSonyTV)  # real on_connect handshake
-    await tv.start()
+    tv = make_tv(link, cls=SonyTV)  # real on_connect handshake
+    await tv.connect()
     try:
         assert tv.supports_queries is True
         assert tv.state.power is PowerState.OFF
     finally:
-        await tv.stop()
+        await tv.disconnect()
 
 
 async def test_handshake_set_only_when_queries_unanswered(link) -> None:
-    tv = make_tv(link, cls=FastSonyTV)  # nothing answers -> queries time out
-    await tv.start()
+    tv = make_tv(link, cls=SonyTV)  # nothing answers -> queries time out
+    await tv.connect()
     try:
         assert tv.supports_queries is False
     finally:
-        await tv.stop()
+        await tv.disconnect()
 
 
 async def test_handshake_power_on_runs_full_query(link) -> None:
@@ -153,14 +152,14 @@ async def test_handshake_power_on_runs_full_query(link) -> None:
             Function.VOLUME.value: b"\x01\x28",  # 40
         },
     )
-    tv = make_tv(link, cls=FastSonyTV)
-    await tv.start()
+    tv = make_tv(link, cls=SonyTV)
+    await tv.connect()
     try:
         assert tv.supports_queries is True
         assert tv.state.power is PowerState.ON
         assert tv.state.volume == 40  # full query ran because the TV is on
     finally:
-        await tv.stop()
+        await tv.disconnect()
 
 
 # ---- reconnect ---------------------------------------------------------
@@ -170,7 +169,7 @@ async def test_drop_delivers_none_then_reconnects(link) -> None:
     tv = make_tv(link)  # NoHandshake + fast backoff
     snapshots: list = []
     tv.subscribe(snapshots.append)
-    await tv.start()
+    await tv.connect()
     try:
         await asyncio.sleep(0)
         link.drop()  # EOF
@@ -179,4 +178,4 @@ async def test_drop_delivers_none_then_reconnects(link) -> None:
         assert link.connects == 2  # serialkit reconnected on its own
         assert tv.connected
     finally:
-        await tv.stop()
+        await tv.disconnect()

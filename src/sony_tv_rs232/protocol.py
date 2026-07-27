@@ -34,7 +34,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ._kit import ProtocolError
+from serialkit import ProtocolError
+
 from .const import (
     CATEGORY,
     HEADER_ANSWER,

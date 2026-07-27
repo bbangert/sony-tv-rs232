@@ -12,7 +12,7 @@ dependencies = [
     "serialx>=1.8.2",
     # The distribution is "serial-toolkit"; the import package is `serialkit`
     # (PyPI blocks the name "serialkit").
-    "serial-toolkit>=0.1.2",
+    "serial-toolkit>=0.2.0",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

@@ -56,9 +56,10 @@ answer frame carries no echo of which command it answers. The library:
 
 - updates `state` optimistically when a Set is acknowledged, and from query
   replies on the Pro Bravia displays that answer them;
-- serializes commands (`max_in_flight = 1`) because answers are unaddressed —
-  this is what prevents a dropped or garbled answer from being misattributed to
-  the next command (the desync this library was rewritten to fix);
+- runs every command as an exclusive exchange, because answers are
+  unaddressed — holding the wire for one send-and-read round, anchored on
+  arrival order, is what keeps a dropped or garbled answer from being read as
+  the next command's;
 - paces commands ≥ 500 ms apart, as the Sony spec requires;
 - reconnects automatically when the serial link drops.
 

@@ -1,34 +1,38 @@
-"""Main SonyTV controller, built on serialkit.
+"""Main SonyTV controller.
 
-The robustness machinery (framing, request/response correlation, pacing,
-reconnect, the read loop) lives in :class:`serialkit.SerialDevice`. This module
-is the Sony command surface plus the wiring that configures the runtime.
+The wire machinery — framing, pacing, the read loop, reconnect — lives in
+:class:`serialkit.SerialLink`, which this class owns. What is here is the Sony
+command surface, the device model, and the decoding that turns a reply into a
+value.
 
-Sony answer frames carry no identifying content, so responses cannot be
-correlated by content. Commands are therefore serialized with
-``max_in_flight = 1`` (one command owed a reply at a time); serialkit's slot
-gate and write-abandon then guarantee that a dropped or garbled answer times
-its command out rather than being misattributed to the next one.
+Every Sony answer frame is caused by something we sent: the TV emits nothing
+unsolicited, and a reply carries no identifier saying which command it answers.
+Commands therefore run inside :meth:`serialkit.SerialLink.exchange`, which
+holds the wire for one send-and-read round so the reply is unambiguous, and
+anchors on arrival order so a late reply to a timed-out command cannot be read
+as the next one's answer.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any, TypeVar
 
 import serialx
-
-from ._kit import (
+from serialkit import (
+    Backoff,
     CommandTimeoutError,
     Pacing,
     ProtocolError,
-    SerialDevice,
+    SerialLink,
 )
+
 from .const import (
     BAUD_RATE,
     COMMAND_TIMEOUT,
-    HEADER_ANSWER,
     INTER_COMMAND_DELAY,
     AdvancedIris,
     CineMotion,
@@ -74,8 +78,8 @@ def _parse_power(data: bytes) -> PowerState:
 # Function -> (state attribute, decoder mapping reply data to the value). Reply
 # data mirrors the Set shape: most values sit at data[1] behind the 0x01
 # "Direct" marker; Power/Input/CineMotion/AdvancedIris carry the value(s) at
-# data[0], and Treble/Bass at data[2]. query_state() walks these functions.
-_QUERY_DECODERS: dict[Function, tuple[str, Callable[[bytes], object]]] = {
+# data[0], and Treble/Bass at data[2]. refresh() walks these functions.
+_QUERY_DECODERS: dict[Function, tuple[str, Callable[[bytes], Any]]] = {
     Function.POWER: ("power", _parse_power),
     Function.INPUT_SELECT: ("input_source", lambda d: InputSource(tuple(d))),
     Function.VOLUME: ("volume", lambda d: byte_to_percent(d[1])),
@@ -96,69 +100,144 @@ _QUERY_DECODERS: dict[Function, tuple[str, Callable[[bytes], object]]] = {
     Function.OFF_TIMER: ("off_timer", lambda d: OffTimer(d[1])),
 }
 
-# Functions worth polling in query_state(); consumer Bravias ignore them all
-# and each simply times out (best effort).
+# Functions worth polling in refresh(); consumer Bravias honour only a few and
+# the rest simply time out (best effort).
 _QUERYABLE: tuple[Function, ...] = tuple(_QUERY_DECODERS)
 
 
-def _is_answer(frame: bytes) -> bool:
-    """Match any answer frame.
-
-    Sony answers carry no echo of the request, so there is nothing to
-    correlate on by content — ``max_in_flight = 1`` guarantees there is only
-    ever one pending, so the sole answer belongs to it.
-    """
-    return frame.startswith(bytes([HEADER_ANSWER]))
-
-
-class SonyTV(SerialDevice[TVState]):
+class SonyTV:
     """Async controller for a Sony Bravia TV over RS232.
 
     Speaks the Sony Bravia RS-232C protocol over any serialx-supported URL
     (``/dev/ttyUSB0``, ``socket://host:port``, ``esphome://host/?port_name=TTL``).
 
     Sony's documented protocol is set-only: every Set command is acknowledged
-    and ``state`` is updated optimistically when an ack arrives. A
-    community-discovered query format is also supported for the models that
-    honour it; ``query_*`` methods time out on sets that don't.
+    and ``state`` is updated when an ack arrives. A community-discovered query
+    format is also supported for the models that honour it; ``query_*`` methods
+    time out on sets that don't.
     """
 
-    framer_factory = SonyAnswerFramer
-    max_in_flight = 1  # Sony answers are unaddressed: serialize (see _is_answer)
-    pacing = Pacing(min_interval=INTER_COMMAND_DELAY)  # >= 500 ms between sends
-    probe = None  # explicit: consumer Bravias ignore queries, so no watchdog
-    request_timeout = COMMAND_TIMEOUT
-
-    def __init__(self, port: str) -> None:
+    def __init__(
+        self,
+        port: str,
+        *,
+        baudrate: int = BAUD_RATE,
+        command_timeout: float = COMMAND_TIMEOUT,
+        inter_command_delay: float = INTER_COMMAND_DELAY,
+        backoff: Backoff | None = None,
+        connect: Callable[[], Any] | None = None,
+    ) -> None:
         self._port = port
-        super().__init__(self._open_connection)
+        self._baudrate = baudrate
+        self._command_timeout = command_timeout
+        self.state = TVState()
+        self.link = SerialLink(
+            connect=connect or self._open_connection,
+            framer=SonyAnswerFramer(),
+            handler=self,
+            pacing=Pacing(min_interval=inter_command_delay),
+            # Liveness is deliberately unset for now. FailureCount is the right
+            # shape for a device that emits nothing unsolicited, but a refresh
+            # against a set-only TV produces a long run of consecutive
+            # timeouts, which would trip it on every connect. It can be enabled
+            # once refresh() only asks for functions the TV is known to answer.
+            liveness=None,
+            backoff=backoff or Backoff(),
+        )
         # True once the TV answers any query, False once a probe goes
         # unanswered (consumer sets are set-only). None until first probed.
         self._supports_queries: bool | None = None
+        self._subscribers: list[StateCallback] = []
+        self._notify_dirty = False
+        self._notify_scheduled = False
+        self._batch_depth = 0
 
-    async def _open_connection(self) -> tuple[object, object]:
-        return await serialx.open_serial_connection(self._port, baudrate=BAUD_RATE)
+    async def _open_connection(self) -> tuple[Any, Any]:
+        return await serialx.open_serial_connection(self._port, baudrate=self._baudrate)
 
     @property
     def supports_queries(self) -> bool | None:
         """Whether the TV has answered a query since connecting."""
         return self._supports_queries
 
-    # -- serialkit lifecycle callbacks --------------------------------------
+    @property
+    def connected(self) -> bool:
+        return self.link.connected
 
-    def make_state(self) -> TVState:
-        return TVState()
+    # -- Subscribers ---------------------------------------------------------
 
-    def copy_state(self, state: TVState) -> TVState:
-        # TVState is all immutable-valued fields; a shallow replace() snapshot
-        # is correct and far cheaper than deepcopy.
-        return state.copy()
+    def subscribe(self, callback: StateCallback) -> Callable[[], None]:
+        """Register ``callback`` for state updates; returns an unsubscribe fn.
+
+        The callback receives the live :class:`TVState` when something changes,
+        and ``None`` when the connection drops.
+        """
+        self._subscribers.append(callback)
+
+        def unsubscribe() -> None:
+            try:
+                self._subscribers.remove(callback)
+            except ValueError:
+                pass
+
+        return unsubscribe
+
+    def notify(self) -> None:
+        """Request a coalesced state update to subscribers.
+
+        Any number of calls within one event-loop turn (or one :meth:`batch`
+        block) deliver a single callback.
+        """
+        self._notify_dirty = True
+        if not self._notify_scheduled:
+            self._notify_scheduled = True
+            asyncio.get_running_loop().call_soon(self._flush_notify)
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        """Hold notifications for the block, then deliver one.
+
+        A refresh round updates many fields; without this each one would reach
+        subscribers separately.
+        """
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0:
+                self._flush_notify()
+
+    def _flush_notify(self) -> None:
+        self._notify_scheduled = False
+        if self._batch_depth or not self._notify_dirty:
+            return
+        self._notify_dirty = False
+        self._deliver(self.state)
+
+    def _deliver(self, state: TVState | None) -> None:
+        for callback in list(self._subscribers):
+            try:
+                callback(state)
+            except Exception:
+                _LOGGER.exception("State subscriber raised")
+
+    # -- serialkit DeviceHandler callbacks ----------------------------------
+
+    def on_frame(self, frame: bytes) -> None:
+        """Frames outside an exchange.
+
+        Sony emits nothing unsolicited and every command claims its own reply,
+        so anything arriving here is a late reply to a command that already
+        timed out.
+        """
+        _LOGGER.debug("Unsolicited answer dropped: %s", frame.hex(" "))
 
     async def on_connect(self) -> None:
-        """Arm standby listening, then probe query support (frames flow here).
+        """Arm standby listening, then probe query support.
 
-        serialkit calls this on every (re)connection, so state repopulation is
-        owned by the driver, not the HA coordinator.
+        The link calls this on every connection with frames already flowing, so
+        repopulating state is owned by the driver rather than the consumer.
         """
         try:
             await self.enable_standby_listening()
@@ -172,34 +251,32 @@ class SonyTV(SerialDevice[TVState]):
             return
         self._supports_queries = True
         if power is PowerState.ON:
-            await self.query_state()
+            await self.refresh()
 
-    def on_frame(self, frame: bytes) -> None:
-        # Sony emits nothing unsolicited; every frame answers the sole pending.
-        if not self.pending.feed(frame):
-            _LOGGER.debug("Unsolicited answer dropped: %s", frame.hex(" "))
+    def on_disconnect(self, exc: Exception | None) -> None:
+        self._notify_dirty = False  # a pending update must not outrun None
+        self._deliver(None)
 
-    # -- Connection lifecycle (aliases over serialkit start/stop) -----------
+    # -- Connection lifecycle ------------------------------------------------
 
     async def connect(self) -> None:
         """Open the serial connection and run the handshake."""
-        await self.start()
+        await self.link.start()
         _LOGGER.info("Connected to Sony TV on %s", self._port)
 
     async def disconnect(self) -> None:
         """Close the serial connection (no reconnect)."""
-        await self.stop()
+        await self.link.stop()
         _LOGGER.info("Disconnected from Sony TV")
 
     # -- Status queries (compound) ------------------------------------------
 
-    async def query_state(self) -> None:
+    async def refresh(self) -> None:
         """Query every supported attribute and populate ``state``.
 
-        Each query is serialized (``max_in_flight = 1``); sets that do not
-        honour queries simply time out and the loop moves on. Notifications are
-        batched so a full round delivers one subscriber update, not one per
-        answered function.
+        Each query holds the wire for its own round; a TV that does not honour
+        a query simply times out and the round moves on. Updates are batched,
+        so a full round delivers one subscriber callback.
         """
         with self.batch():
             for function in _QUERYABLE:
@@ -224,7 +301,8 @@ class SonyTV(SerialDevice[TVState]):
 
     async def query_power(self) -> PowerState:
         """Query the TV's power state (community query format)."""
-        return await self._query(Function.POWER)
+        power: PowerState = await self._query(Function.POWER)
+        return power
 
     async def enable_standby_listening(self) -> None:
         """Allow the TV to accept Power ON commands while in standby.
@@ -250,7 +328,8 @@ class SonyTV(SerialDevice[TVState]):
         await self._set(Function.INPUT_SELECT, bytes(InputSource.TOGGLE.value))
 
     async def query_input_source(self) -> InputSource:
-        return await self._query(Function.INPUT_SELECT)
+        source: InputSource = await self._query(Function.INPUT_SELECT)
+        return source
 
     # -- Volume / mute -------------------------------------------------------
 
@@ -266,7 +345,8 @@ class SonyTV(SerialDevice[TVState]):
         await self._set(Function.VOLUME, bytes([0x00, 0x01]))
 
     async def query_volume(self) -> int:
-        return await self._query(Function.VOLUME)
+        volume: int = await self._query(Function.VOLUME)
+        return volume
 
     async def mute_on(self) -> None:
         await self._set(Function.AUDIO_MUTE, bytes([0x01, 0x01]))
@@ -281,7 +361,8 @@ class SonyTV(SerialDevice[TVState]):
 
     async def query_mute(self) -> bool:
         """Query mute. Returns True when audio is muted."""
-        return await self._query(Function.AUDIO_MUTE)
+        muted: bool = await self._query(Function.AUDIO_MUTE)
+        return muted
 
     # -- Picture controls (all 0..100) --------------------------------------
 
@@ -291,21 +372,24 @@ class SonyTV(SerialDevice[TVState]):
         self._apply("picture_level", percent)
 
     async def query_picture_level(self) -> int:
-        return await self._query(Function.PICTURE)
+        level: int = await self._query(Function.PICTURE)
+        return level
 
     async def set_brightness(self, percent: int) -> None:
         await self._set(Function.BRIGHTNESS, bytes([0x01, percent_to_byte(percent)]))
         self._apply("brightness", percent)
 
     async def query_brightness(self) -> int:
-        return await self._query(Function.BRIGHTNESS)
+        brightness: int = await self._query(Function.BRIGHTNESS)
+        return brightness
 
     async def set_color(self, percent: int) -> None:
         await self._set(Function.COLOR, bytes([0x01, percent_to_byte(percent)]))
         self._apply("color", percent)
 
     async def query_color(self) -> int:
-        return await self._query(Function.COLOR)
+        color: int = await self._query(Function.COLOR)
+        return color
 
     async def set_hue(self, red: int, green: int) -> None:
         """Set hue. Sony exposes both red-bias and green-bias on a 0..100 scale."""
@@ -319,7 +403,8 @@ class SonyTV(SerialDevice[TVState]):
         self._apply("sharpness", percent)
 
     async def query_sharpness(self) -> int:
-        return await self._query(Function.SHARPNESS)
+        sharpness: int = await self._query(Function.SHARPNESS)
+        return sharpness
 
     # -- Audio controls ------------------------------------------------------
 
@@ -348,14 +433,16 @@ class SonyTV(SerialDevice[TVState]):
         self._apply("picture_mode", mode)
 
     async def query_picture_mode(self) -> PictureMode:
-        return await self._query(Function.PICTURE_MODE)
+        mode: PictureMode = await self._query(Function.PICTURE_MODE)
+        return mode
 
     async def set_sound_mode(self, mode: SoundMode) -> None:
         await self._set(Function.SOUND_MODE, bytes([0x01, mode.value]))
         self._apply("sound_mode", mode)
 
     async def query_sound_mode(self) -> SoundMode:
-        return await self._query(Function.SOUND_MODE)
+        mode: SoundMode = await self._query(Function.SOUND_MODE)
+        return mode
 
     async def set_cine_motion(self, mode: CineMotion) -> None:
         await self._set(Function.CINE_MOTION, bytes([mode.value]))
@@ -371,7 +458,8 @@ class SonyTV(SerialDevice[TVState]):
         self._apply("wide_mode", mode)
 
     async def query_wide_mode(self) -> WideMode:
-        return await self._query(Function.WIDE_MODE)
+        mode: WideMode = await self._query(Function.WIDE_MODE)
+        return mode
 
     async def set_4_3_mode(self, mode: Mode4_3) -> None:
         await self._set(Function.MODE_4_3, bytes([0x01, mode.value]))
@@ -398,9 +486,20 @@ class SonyTV(SerialDevice[TVState]):
 
     # -- Internals ----------------------------------------------------------
 
+    async def _round_trip(self, packet: bytes) -> bytes:
+        """Send one packet and read its reply, holding the wire for both.
+
+        Exclusivity is what makes the reply attributable at all: Sony answers
+        carry no identifier, so the only thing that makes this frame *this*
+        command's answer is that nothing else was outstanding.
+        """
+        async with self.link.exchange() as exchange:
+            await exchange.send(packet)
+            return await exchange.next(timeout=self._command_timeout)
+
     async def _set(self, function: Function, data: bytes) -> Answer:
         """Send a Set/Control packet and wait for the (validated) ack."""
-        frame = await self.request(encode_control(function.value, data), _is_answer)
+        frame = await self._round_trip(encode_control(function.value, data))
         answer = parse_answer(frame)
         answer.raise_for_status(function.value)
         return answer
@@ -409,10 +508,10 @@ class SonyTV(SerialDevice[TVState]):
         """Query the TV, decode the reply via the table, update state, return it.
 
         Raises SonyProtocolError if the reply can't be decoded (e.g. a
-        data-less ack from a set-only TV), which query_state() and the connect
+        data-less ack from a set-only TV), which refresh() and the connect
         handshake treat as "unanswered".
         """
-        frame = await self.request(encode_query(function.value), _is_answer)
+        frame = await self._round_trip(encode_query(function.value))
         answer = parse_answer(frame)
         answer.raise_for_status(function.value)
         attr, decoder = _QUERY_DECODERS[function]

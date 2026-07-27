@@ -13,6 +13,8 @@ import argparse
 import asyncio
 import logging
 import sys
+from contextlib import suppress
+from enum import Enum
 
 from . import (
     CommandTimeoutError,
@@ -30,7 +32,7 @@ from . import (
 def _format_enum(val: object | None) -> str:
     if val is None:
         return "?"
-    if hasattr(val, "name"):
+    if isinstance(val, Enum):
         return val.name
     return str(val)
 
@@ -86,7 +88,7 @@ async def _diagnose(port: str) -> int:
     """
     import serialx
 
-    from . import BAUD_RATE, encode_query, Function
+    from . import BAUD_RATE, Function, encode_query
 
     print(f"[diag] Opening {port} at {BAUD_RATE} baud (raw)...")
     reader, writer = await serialx.open_serial_connection(port, baudrate=BAUD_RATE)
@@ -111,10 +113,9 @@ async def _diagnose(port: str) -> int:
     finally:
         task.cancel()
         writer.close()
-        try:
+        # Best effort: the port is going away regardless of how it objects.
+        with suppress(Exception):
             await writer.wait_closed()
-        except Exception:
-            pass
 
     if received:
         print(
@@ -189,7 +190,7 @@ async def _run(args: argparse.Namespace) -> int:
             return 0
         if args.wide is not None:
             try:
-                mode = WideMode[args.wide.upper()]
+                wide_mode = WideMode[args.wide.upper()]
             except KeyError:
                 print(
                     f"Unknown wide mode: {args.wide!r}. "
@@ -197,12 +198,12 @@ async def _run(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            print(f"Setting wide mode {mode.name}...")
-            await tv.set_wide_mode(mode)
+            print(f"Setting wide mode {wide_mode.name}...")
+            await tv.set_wide_mode(wide_mode)
             return 0
         if args.picture_mode is not None:
             try:
-                mode = PictureMode[args.picture_mode.upper()]
+                picture_mode = PictureMode[args.picture_mode.upper()]
             except KeyError:
                 print(
                     f"Unknown picture mode: {args.picture_mode!r}. "
@@ -210,8 +211,8 @@ async def _run(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            print(f"Setting picture mode {mode.name}...")
-            await tv.set_picture_mode(mode)
+            print(f"Setting picture mode {picture_mode.name}...")
+            await tv.set_picture_mode(picture_mode)
             return 0
         if args.display:
             print("Toggling on-screen info display...")
@@ -236,7 +237,7 @@ async def _run(args: argparse.Namespace) -> int:
             return 0
 
         print("Querying TV state...")
-        await tv.query_state()
+        await tv.refresh()
         _print_state(tv.state)
         return 0
     finally:
