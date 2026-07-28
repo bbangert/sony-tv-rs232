@@ -78,7 +78,7 @@ def make_tv(link: FakeLink, cls: type[SonyTV] = NoHandshakeSonyTV) -> SonyTV:
     so the suite runs in milliseconds rather than seconds."""
     return cls(
         "mock://test",
-        connect=link.connect,
+        connect_factory=link.connect,
         command_timeout=0.2,
         inter_command_delay=0.0,
         backoff=FAST_BACKOFF,

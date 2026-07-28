@@ -125,14 +125,14 @@ class SonyTV:
         command_timeout: float = COMMAND_TIMEOUT,
         inter_command_delay: float = INTER_COMMAND_DELAY,
         backoff: Backoff | None = None,
-        connect: Callable[[], Any] | None = None,
+        connect_factory: Callable[[], Any] | None = None,
     ) -> None:
         self._port = port
         self._baudrate = baudrate
         self._command_timeout = command_timeout
         self.state = TVState()
         self.link = SerialLink(
-            connect=connect or self._open_connection,
+            connect=connect_factory or self._open_connection,
             framer=SonyAnswerFramer(),
             handler=self,
             pacing=Pacing(min_interval=inter_command_delay),
