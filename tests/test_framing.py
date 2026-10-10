@@ -1,8 +1,7 @@
 """SonyAnswerFramer byte-vector regression suite.
 
-Includes the sony garbled-short-ack vector (deferred here from serialkit's
-Phase 2 because it needs the checksum-discriminated framer the general framers
-cannot express)."""
+Includes the garbled-short-ack vector, which needs the checksum-discriminated
+framer the general serialkit framers cannot express."""
 
 from __future__ import annotations
 

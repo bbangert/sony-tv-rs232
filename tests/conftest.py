@@ -44,6 +44,10 @@ class FakeSonyTV:
     Sets are acked (COMPLETED). Queries for functions in ``query_data`` get a
     long reply echoing that data; unscripted queries get a bare COMPLETED ack
     (no data), which the driver treats as "answered but nothing to decode".
+
+    ``parse_error_first`` models a receiver that slept through an idle gap:
+    that many writes are NAKed with PARSE_ERROR (the leading bytes were lost
+    waking up) before normal dispatch resumes.
     """
 
     def __init__(
@@ -51,14 +55,20 @@ class FakeSonyTV:
         link: FakeLink,
         *,
         query_data: dict[int, bytes] | None = None,
+        parse_error_first: int = 0,
     ) -> None:
         self.link = link
         self.query_data = dict(query_data or {})
+        self.parse_error_first = parse_error_first
         self.received: list[bytes] = []
         link.on_write = self._on_write
 
     def _on_write(self, packet: bytes) -> None:
         self.received.append(packet)
+        if self.parse_error_first:
+            self.parse_error_first -= 1
+            self.link.rx(short_ack(0x04))  # PARSE_ERROR: woke up mid-frame
+            return
         header = packet[0]
         function = packet[2]
         if header == HEADER_INQUIRY:

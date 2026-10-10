@@ -20,7 +20,9 @@ src/sony_tv_rs232/
 tests/
   conftest.py       -- FakeSonyTV responder + NoHandshakeSonyTV harness
   test_framing.py   -- SonyAnswerFramer byte vectors (incl. garbled-short-ack)
-  test_tv.py        -- desync regression, set/query round-trips, handshake, reconnect
+  test_protocol.py  -- checksum / encode / parse_answer vectors
+  test_tv.py        -- desync regression, set/query round-trips, exact Set bytes,
+                       idle-wake resend, handshake, reconnect
 ```
 
 ## Why it's shaped this way
@@ -45,6 +47,19 @@ tests/
   never reaches `on_frame` — the answer bytes alone do not say what they
   answer. Each `set_*`/`query_*` therefore awaits its round trip and then
   mutates `state` and calls `notify()` on the caller task.
+- **The first frame after idle is resent once.** A TV whose receiver has
+  slept (> ~10 s since its last reply) loses the leading bytes of the next
+  frame and answers `PARSE_ERROR` after its ~550 ms receive timeout; frames
+  sent within ~400 ms of a reply parse fine. `_round_trip` decodes the answer
+  and, on `PARSE_ERROR`, resends inside the *same* held exchange, bounded by
+  `IDLE_WAKE_RETRIES`, with no added delay so the resend lands in the wake
+  window. This matters most for `on_connect`, whose standby-enable is by
+  construction the first frame after a gap. The division of labour: the kit
+  retries on timeouts it can see (`confirm(retries=)`); the driver retries on
+  reply content only it can decode.
+- **`on_connect` always ends with `notify()`.** A reconnect to a TV whose
+  state did not change would otherwise deliver nothing after the disconnect's
+  `None`, leaving a consumer unavailable until its next poll.
 - **Subscriptions live here, not in the kit.** `serialkit` holds no device
   state, so `subscribe()`/`notify()`/`batch()` are this package's own,
   coalescing through `call_soon` so a `refresh()` round delivers one callback.

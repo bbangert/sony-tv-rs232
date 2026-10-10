@@ -6,6 +6,13 @@ BAUD_RATE = 9600
 COMMAND_TIMEOUT = 2.0  # seconds to wait for a response
 INTER_COMMAND_DELAY = 0.5  # Sony spec mandates >= 500ms between commands
 
+# A receiver that has slept through an idle gap (> ~10 s) drops the leading
+# bytes of the first frame and answers PARSE_ERROR after its own receive
+# timeout (~550 ms). The frame is lost, not misparsed (the checksum failed),
+# so resending it once is side-effect free. Frames sent within ~400 ms of the
+# previous reply parse normally, which is why the resend must not add delay.
+IDLE_WAKE_RETRIES = 1
+
 # Packet header bytes
 HEADER_CONTROL = 0x8C  # host -> TV: Set / Write request
 HEADER_INQUIRY = 0x83  # host -> TV: Query / Get request

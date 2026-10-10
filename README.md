@@ -1,8 +1,8 @@
 # sony-tv-rs232
 
 Async Python library to control Sony Bravia TVs over RS232 serial, built on
-[serialkit](https://github.com/bbangert/serialkit) and
-[serialx](https://github.com/puddly/serialx).
+[serialkit](https://pypi.org/project/serial-toolkit/) (the `serial-toolkit`
+distribution on PyPI) and [serialx](https://github.com/puddly/serialx).
 
 ## Installation
 
@@ -61,6 +61,9 @@ answer frame carries no echo of which command it answers. The library:
   arrival order, is what keeps a dropped or garbled answer from being read as
   the next command's;
 - paces commands ≥ 500 ms apart, as the Sony spec requires;
+- resends the first command after an idle gap once: a TV that has slept
+  loses the leading bytes of the frame that wakes it and answers
+  `PARSE_ERROR`, so that reply is treated as "send it again";
 - reconnects automatically when the serial link drops.
 
 All of that machinery lives in `serialkit`; this library is the Sony command
@@ -98,7 +101,8 @@ serialx-compatible URL (`/dev/ttyUSB0`, `socket://host:port`,
 
 ```bash
 uv run --python 3.14 pytest
-uvx ruff check
+uv run --python 3.14 --with mypy mypy --strict src/
+uvx ruff check && uvx ruff format --check
 ```
 
 The RS-232C protocol reference is in [docs/](docs/).

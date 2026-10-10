@@ -33,8 +33,10 @@ from serialkit import (
 from .const import (
     BAUD_RATE,
     COMMAND_TIMEOUT,
+    IDLE_WAKE_RETRIES,
     INTER_COMMAND_DELAY,
     AdvancedIris,
+    AnswerCode,
     CineMotion,
     ClosedCaption,
     Function,
@@ -236,6 +238,9 @@ class SonyTV:
 
         The link calls this on every connection with frames already flowing, so
         repopulating state is owned by the driver rather than the consumer.
+        Subscribers always get a state at the end, even when nothing changed:
+        a reconnect to an unchanged TV must still cancel the ``None`` that the
+        disconnect delivered.
         """
         try:
             await self.enable_standby_listening()
@@ -246,10 +251,11 @@ class SonyTV:
         except (CommandTimeoutError, ProtocolError) as err:
             self._supports_queries = False
             _LOGGER.debug("TV did not answer a power query (%s); set-only mode", err)
-            return
-        self._supports_queries = True
-        if power is PowerState.ON:
-            await self.refresh()
+        else:
+            self._supports_queries = True
+            if power is PowerState.ON:
+                await self.refresh()
+        self.notify()
 
     def on_disconnect(self, exc: Exception | None) -> None:  # noqa: ARG002
         self._notify_dirty = False  # a pending update must not outrun None
@@ -484,21 +490,40 @@ class SonyTV:
 
     # -- Internals ----------------------------------------------------------
 
-    async def _round_trip(self, packet: bytes) -> bytes:
-        """Send one packet and read its reply, holding the wire for both.
+    async def _round_trip(self, packet: bytes) -> Answer:
+        """Send one packet and read its decoded reply, holding the wire for both.
 
         Exclusivity is what makes the reply attributable at all: Sony answers
         carry no identifier, so the only thing that makes this frame *this*
         command's answer is that nothing else was outstanding.
+
+        A TV that has gone idle answers the first frame with PARSE_ERROR
+        because it lost the leading bytes waking up; that reply is the signal
+        to resend once, inside the same exchange so the retry is still the
+        only thing on the wire. The resend re-anchors on arrival order, so the
+        NAK already consumed cannot be re-read as the retry's answer. A
+        persistent PARSE_ERROR (a genuinely malformed packet) still surfaces
+        after ``IDLE_WAKE_RETRIES`` extra sends.
         """
         async with self.link.exchange() as exchange:
-            await exchange.send(packet)
-            return await exchange.next(timeout=self._command_timeout)
+            attempt = 0
+            while True:
+                await exchange.send(packet)
+                frame = await exchange.next(timeout=self._command_timeout)
+                answer = parse_answer(frame)
+                if (
+                    answer.code is not AnswerCode.PARSE_ERROR
+                    or attempt >= IDLE_WAKE_RETRIES
+                ):
+                    return answer
+                attempt += 1
+                _LOGGER.debug(
+                    "TV reported PARSE_ERROR (first frame after idle); resending"
+                )
 
     async def _set(self, function: Function, data: bytes) -> Answer:
         """Send a Set/Control packet and wait for the (validated) ack."""
-        frame = await self._round_trip(encode_control(function.value, data))
-        answer = parse_answer(frame)
+        answer = await self._round_trip(encode_control(function.value, data))
         answer.raise_for_status(function.value)
         return answer
 
@@ -509,8 +534,7 @@ class SonyTV:
         data-less ack from a set-only TV), which refresh() and the connect
         handshake treat as "unanswered".
         """
-        frame = await self._round_trip(encode_query(function.value))
-        answer = parse_answer(frame)
+        answer = await self._round_trip(encode_query(function.value))
         answer.raise_for_status(function.value)
         attr, decoder = _QUERY_DECODERS[function]
         value = self._decode(answer, decoder)
