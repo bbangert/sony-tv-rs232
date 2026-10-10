@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Any, TypeVar
 
 import serialx
@@ -175,10 +175,8 @@ class SonyTV:
         self._subscribers.append(callback)
 
         def unsubscribe() -> None:
-            try:
+            with suppress(ValueError):
                 self._subscribers.remove(callback)
-            except ValueError:
-                pass
 
         return unsubscribe
 
@@ -253,7 +251,7 @@ class SonyTV:
         if power is PowerState.ON:
             await self.refresh()
 
-    def on_disconnect(self, exc: Exception | None) -> None:
+    def on_disconnect(self, exc: Exception | None) -> None:  # noqa: ARG002
         self._notify_dirty = False  # a pending update must not outrun None
         self._deliver(None)
 

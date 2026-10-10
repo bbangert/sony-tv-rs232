@@ -58,7 +58,8 @@ class SonyCommandError(ProtocolError):
 
     def __init__(self, code: AnswerCode, function: int) -> None:
         super().__init__(
-            f"TV returned {code.name} (0x{code.value:02x}) for function 0x{function:02x}"
+            f"TV returned {code.name} (0x{code.value:02x}) "
+            f"for function 0x{function:02x}"
         )
         self.code = code
         self.function = function

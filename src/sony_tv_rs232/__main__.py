@@ -119,7 +119,8 @@ async def _diagnose(port: str) -> int:
 
     if received:
         print(
-            f"[diag] Got {len(received)} chunks; total {sum(len(c) for c in received)} bytes"
+            f"[diag] Got {len(received)} chunks; "
+            f"total {sum(len(c) for c in received)} bytes"
         )
         return 0
     print(
