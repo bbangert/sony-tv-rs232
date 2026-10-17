@@ -10,7 +10,7 @@ import asyncio
 
 import pytest
 from conftest import FakeSonyTV, make_tv, short_ack
-from serialkit import CommandTimeoutError
+from serialkit import CommandTimeoutError, ConnectionLostError
 
 from sony_tv_rs232 import (
     AnswerCode,
@@ -261,6 +261,28 @@ async def test_handshake_survives_parse_error_on_first_frame(link) -> None:
         assert tv.state.power is PowerState.OFF
     finally:
         await tv.disconnect()
+
+
+# ---- connect failures --------------------------------------------------
+
+
+class _ProxyUnavailable(Exception):
+    """A transport's open failure that is not an OSError (serialx's is not)."""
+
+
+async def test_connect_failure_is_a_kit_connection_error() -> None:
+    """Whatever the transport raises when the port cannot be opened, connect()
+    raises the kit's ConnectionLostError with the original as its cause, so a
+    consumer retrying on SerialKitError sees every transport the same way."""
+
+    async def refuse() -> tuple[object, object]:
+        raise _ProxyUnavailable("serial proxy unavailable")
+
+    tv = SonyTV("mock://test", connect_factory=refuse)
+    with pytest.raises(ConnectionLostError) as excinfo:
+        await tv.connect()
+    assert isinstance(excinfo.value.__cause__, _ProxyUnavailable)
+    assert not tv.connected
 
 
 # ---- lifecycle notifications ------------------------------------------
