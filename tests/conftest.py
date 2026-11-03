@@ -7,6 +7,8 @@ the driver can be exercised end-to-end (handshake, queries, sets).
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from serialkit import Backoff
 from serialkit.testing import FakeLink
@@ -47,7 +49,8 @@ class FakeSonyTV:
 
     ``parse_error_first`` models a receiver that slept through an idle gap:
     that many writes are NAKed with PARSE_ERROR (the leading bytes were lost
-    waking up) before normal dispatch resumes.
+    waking up) before normal dispatch resumes. ``silent_first`` is the silent
+    flavour of the same wake: that many writes get no answer at all.
     """
 
     def __init__(
@@ -56,15 +59,20 @@ class FakeSonyTV:
         *,
         query_data: dict[int, bytes] | None = None,
         parse_error_first: int = 0,
+        silent_first: int = 0,
     ) -> None:
         self.link = link
         self.query_data = dict(query_data or {})
         self.parse_error_first = parse_error_first
+        self.silent_first = silent_first
         self.received: list[bytes] = []
         link.on_write = self._on_write
 
     def _on_write(self, packet: bytes) -> None:
         self.received.append(packet)
+        if self.silent_first:
+            self.silent_first -= 1
+            return  # swallowed waking up: no answer at all
         if self.parse_error_first:
             self.parse_error_first -= 1
             self.link.rx(short_ack(0x04))  # PARSE_ERROR: woke up mid-frame
@@ -83,7 +91,9 @@ def link() -> FakeLink:
     return FakeLink()
 
 
-def make_tv(link: FakeLink, cls: type[SonyTV] = NoHandshakeSonyTV) -> SonyTV:
+def make_tv(
+    link: FakeLink, cls: type[SonyTV] = NoHandshakeSonyTV, **kwargs: Any
+) -> SonyTV:
     """Build a SonyTV on the fake transport, with pacing and timeouts shrunk
     so the suite runs in milliseconds rather than seconds."""
     return cls(
@@ -92,4 +102,5 @@ def make_tv(link: FakeLink, cls: type[SonyTV] = NoHandshakeSonyTV) -> SonyTV:
         command_timeout=0.2,
         inter_command_delay=0.0,
         backoff=FAST_BACKOFF,
+        **kwargs,
     )

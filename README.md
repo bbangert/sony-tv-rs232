@@ -63,7 +63,9 @@ answer frame carries no echo of which command it answers. The library:
 - paces commands ≥ 500 ms apart, as the Sony spec requires;
 - resends the first command after an idle gap once: a TV that has slept
   loses the leading bytes of the frame that wakes it and answers
-  `PARSE_ERROR`, so that reply is treated as "send it again";
+  `PARSE_ERROR`, so that reply is treated as "send it again". When the wake
+  is silent instead, a query (never a set) that goes unanswered after the
+  TV has been quiet for a few seconds is resent once as well;
 - reconnects automatically when the serial link drops.
 
 All of that machinery lives in `serialkit`; this library is the Sony command

@@ -263,6 +263,66 @@ async def test_handshake_survives_parse_error_on_first_frame(link) -> None:
         await tv.disconnect()
 
 
+async def test_silent_query_after_idle_is_resent_once(link) -> None:
+    """The silent flavour of the idle wake: the TV swallows the first query
+    without answering. The query is resent once and the second answer wins."""
+    fake = FakeSonyTV(link, query_data={Function.POWER.value: b"\x00"}, silent_first=1)
+    tv = make_tv(link)  # first query of a session: the TV counts as idle
+    await tv.connect()
+    try:
+        assert await tv.query_power() is PowerState.OFF
+        assert len(fake.received) == 2
+        assert fake.received[0] == fake.received[1]  # identical resend
+        assert link.connects == 1
+    finally:
+        await tv.disconnect()
+
+
+async def test_persistent_silence_after_idle_raises_after_one_resend(
+    link,
+) -> None:
+    fake = FakeSonyTV(link, silent_first=5)
+    tv = make_tv(link)
+    await tv.connect()
+    try:
+        with pytest.raises(CommandTimeoutError):
+            await tv.query_power()
+        assert len(fake.received) == 2  # bounded: one resend, not five
+    finally:
+        await tv.disconnect()
+
+
+async def test_silent_query_soon_after_a_reply_is_not_resent(link) -> None:
+    """A query the model does not support times out right after another
+    reply; resending it would only double the timeout."""
+    fake = FakeSonyTV(link, query_data={Function.POWER.value: b"\x00"})
+    tv = make_tv(link, idle_wake_after=60.0)
+    await tv.connect()
+    try:
+        await tv.query_power()  # the TV just answered
+        fake.silent_first = 5
+        with pytest.raises(CommandTimeoutError):
+            await tv.query_volume()
+        assert len(fake.received) == 2  # power, then volume once
+    finally:
+        await tv.disconnect()
+
+
+async def test_silent_set_is_not_resent(link) -> None:
+    """Silence after a set is ambiguous (the command may have landed and only
+    the ack been lost), and some sets step or toggle, so sets are not
+    resent on a timeout."""
+    fake = FakeSonyTV(link, silent_first=1)
+    tv = make_tv(link)
+    await tv.connect()
+    try:
+        with pytest.raises(CommandTimeoutError):
+            await tv.volume_up()
+        assert len(fake.received) == 1
+    finally:
+        await tv.disconnect()
+
+
 # ---- connect failures --------------------------------------------------
 
 

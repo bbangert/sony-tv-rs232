@@ -57,6 +57,14 @@ tests/
   construction the first frame after a gap. The division of labour: the kit
   retries on timeouts it can see (`confirm(retries=)`); the driver retries on
   reply content only it can decode.
+- **Sometimes the wake is silent.** The TV swallows the first frame and
+  answers nothing (seen on a standby power poll about once a day). A *query*
+  that times out is resent once in the same exchange, but only when the TV has
+  been quiet for `IDLE_WAKE_AFTER` seconds (`_last_reply_at`, reset per
+  session). Without that gate every unsupported query, which times out right
+  after another reply, would cost two timeouts. Sets are never resent on
+  silence: the command may have landed with only the ack lost, and some sets
+  step or toggle.
 - **`on_connect` always ends with `notify()`.** A reconnect to a TV whose
   state did not change would otherwise deliver nothing after the disconnect's
   `None`, leaving a consumer unavailable until its next poll.

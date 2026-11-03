@@ -33,6 +33,7 @@ from serialkit import (
 from .const import (
     BAUD_RATE,
     COMMAND_TIMEOUT,
+    IDLE_WAKE_AFTER,
     IDLE_WAKE_RETRIES,
     INTER_COMMAND_DELAY,
     AdvancedIris,
@@ -128,10 +129,14 @@ class SonyTV:
         inter_command_delay: float = INTER_COMMAND_DELAY,
         backoff: Backoff | None = None,
         connect_factory: Callable[[], Any] | None = None,
+        idle_wake_after: float = IDLE_WAKE_AFTER,
     ) -> None:
         self._port = port
         self._baudrate = baudrate
         self._command_timeout = command_timeout
+        self._idle_wake_after = idle_wake_after
+        # Loop time of the TV's last reply this session; None until it answers.
+        self._last_reply_at: float | None = None
         self.state = TVState()
         self.link = SerialLink(
             connect=connect_factory or self._open_connection,
@@ -258,6 +263,7 @@ class SonyTV:
         self.notify()
 
     def on_disconnect(self, exc: Exception | None) -> None:  # noqa: ARG002
+        self._last_reply_at = None  # a new session starts with the TV idle
         self._notify_dirty = False  # a pending update must not outrun None
         self._deliver(None)
 
@@ -490,36 +496,63 @@ class SonyTV:
 
     # -- Internals ----------------------------------------------------------
 
-    async def _round_trip(self, packet: bytes) -> Answer:
+    async def _round_trip(
+        self, packet: bytes, *, resend_on_silence: bool = False
+    ) -> Answer:
         """Send one packet and read its decoded reply, holding the wire for both.
 
         Exclusivity is what makes the reply attributable at all: Sony answers
         carry no identifier, so the only thing that makes this frame *this*
         command's answer is that nothing else was outstanding.
 
-        A TV that has gone idle answers the first frame with PARSE_ERROR
-        because it lost the leading bytes waking up; that reply is the signal
-        to resend once, inside the same exchange so the retry is still the
-        only thing on the wire. The resend re-anchors on arrival order, so the
-        NAK already consumed cannot be re-read as the retry's answer. A
-        persistent PARSE_ERROR (a genuinely malformed packet) still surfaces
-        after ``IDLE_WAKE_RETRIES`` extra sends.
+        A TV that has gone idle loses the first frame waking up. Usually it
+        says so, answering PARSE_ERROR; sometimes it answers nothing. Either
+        is the signal to resend once (``IDLE_WAKE_RETRIES``), inside the same
+        exchange so the retry is still the only thing on the wire. The resend
+        re-anchors on arrival order, so a reply to the first send that arrives
+        before the resend is discarded, and one arriving after it answers the
+        same packet.
+
+        Silence is only resent when ``resend_on_silence`` is set (queries,
+        which have no side effect) and the TV has been quiet for
+        ``idle_wake_after`` seconds: a query the model does not support times
+        out right after another reply and must not cost a second timeout. A
+        persistent PARSE_ERROR (a genuinely malformed packet) or silence still
+        surfaces after the one resend.
         """
         async with self.link.exchange() as exchange:
-            attempt = 0
+            resends = 0
             while True:
+                after_idle = self._idle()
                 await exchange.send(packet)
-                frame = await exchange.next(timeout=self._command_timeout)
+                try:
+                    frame = await exchange.next(timeout=self._command_timeout)
+                except CommandTimeoutError:
+                    if resend_on_silence and after_idle and resends < IDLE_WAKE_RETRIES:
+                        resends += 1
+                        _LOGGER.debug(
+                            "No reply to the first frame after idle; resending"
+                        )
+                        continue
+                    raise
+                self._last_reply_at = asyncio.get_running_loop().time()
                 answer = parse_answer(frame)
                 if (
                     answer.code is not AnswerCode.PARSE_ERROR
-                    or attempt >= IDLE_WAKE_RETRIES
+                    or resends >= IDLE_WAKE_RETRIES
                 ):
                     return answer
-                attempt += 1
+                resends += 1
                 _LOGGER.debug(
                     "TV reported PARSE_ERROR (first frame after idle); resending"
                 )
+
+    def _idle(self) -> bool:
+        """Whether the TV has been quiet long enough to have fallen asleep."""
+        if self._last_reply_at is None:
+            return True
+        quiet = asyncio.get_running_loop().time() - self._last_reply_at
+        return quiet >= self._idle_wake_after
 
     async def _set(self, function: Function, data: bytes) -> Answer:
         """Send a Set/Control packet and wait for the (validated) ack."""
@@ -534,7 +567,9 @@ class SonyTV:
         data-less ack from a set-only TV), which refresh() and the connect
         handshake treat as "unanswered".
         """
-        answer = await self._round_trip(encode_query(function.value))
+        answer = await self._round_trip(
+            encode_query(function.value), resend_on_silence=True
+        )
         answer.raise_for_status(function.value)
         attr, decoder = _QUERY_DECODERS[function]
         value = self._decode(answer, decoder)
