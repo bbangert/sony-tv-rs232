@@ -44,6 +44,24 @@ async def test_set_updates_state_and_notifies(link) -> None:
         await tv.disconnect()
 
 
+@pytest.mark.parametrize("step", ["volume_up", "volume_down"])
+async def test_volume_step_clears_cached_volume(link, step) -> None:
+    FakeSonyTV(link)  # acks every set
+    tv = make_tv(link)
+    snapshots: list = []
+    tv.subscribe(snapshots.append)
+    await tv.connect()
+    try:
+        await tv.set_volume(20)
+        await getattr(tv, step)()
+        # The ack does not say where the step landed: unknown, not a guess.
+        assert tv.state.volume is None
+        await asyncio.sleep(0)
+        assert snapshots[-1].volume is None
+    finally:
+        await tv.disconnect()
+
+
 async def test_query_returns_value_and_updates_state(link) -> None:
     FakeSonyTV(link, query_data={Function.VOLUME.value: b"\x01\x1e"})  # 0x1e = 30
     tv = make_tv(link)

@@ -381,10 +381,19 @@ class SonyTV:
         self._apply("volume", percent)
 
     async def volume_up(self) -> None:
+        """Step the volume up one unit.
+
+        The acked step does not say where it landed (it may have clamped, or
+        the remote may have moved the volume since the last set), so the
+        cached ``volume`` is cleared rather than guessed.
+        """
         await self._set(Function.VOLUME, bytes([0x00, 0x00]))
+        self._apply("volume", None)
 
     async def volume_down(self) -> None:
+        """Step the volume down one unit; clears ``volume`` like :meth:`volume_up`."""
         await self._set(Function.VOLUME, bytes([0x00, 0x01]))
+        self._apply("volume", None)
 
     async def query_volume(self) -> int:
         volume: int = await self._query(Function.VOLUME)

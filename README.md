@@ -55,7 +55,8 @@ acknowledges every Set command but most models ignore query packets, and the
 answer frame carries no echo of which command it answers. The library:
 
 - updates `state` optimistically when a Set is acknowledged, and from query
-  replies on the Pro Bravia displays that answer them;
+  replies on the Pro Bravia displays that answer them. A relative volume step
+  clears `state.volume`, since its ack does not say where the volume landed;
 - runs every command as an exclusive exchange, because answers are
   unaddressed — holding the wire for one send-and-read round, anchored on
   arrival order, is what keeps a dropped or garbled answer from being read as
