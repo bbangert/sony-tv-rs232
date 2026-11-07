@@ -40,9 +40,16 @@ tests/
   own `Framer`. A checksum-invalid long candidate rescans from `start + 1`
   rather than trusting a corrupt size byte; `max_frame = 32` bounds the resync
   (legitimate frames are ≤ ~8 bytes).
-- **`on_connect` owns the handshake.** It arms standby listening and probes
-  query support with a power query; the link calls it on every connection, so
-  the consumer drives neither reconnect nor state repopulation.
+- **`on_connect` owns the handshake.** It probes query support with a power
+  query, arms standby listening, and runs `refresh()` when the TV is on
+  (`refresh_on_connect=False` skips that, for a caller that only needs the port
+  checked); the link calls it on every connection, so the consumer drives
+  neither reconnect nor state repopulation.
+- **Standby listening is armed while the TV is on.** Sony only honours the arm
+  when it reaches a TV that is on, so `query_power` arms it the first time a
+  session sees the TV on (`_standby_armed`, reset per session). A TV that is
+  off or set-only at connect gets a best-effort arm from `on_connect`; for a
+  set-only TV that is the only chance, since its power is never observed.
 - **Caller-task state updates.** An exchange claims its reply, so the reply
   never reaches `on_frame` — the answer bytes alone do not say what they
   answer. Each `set_*`/`query_*` therefore awaits its round trip and then
@@ -53,16 +60,19 @@ tests/
   sent within ~400 ms of a reply parse fine. `_round_trip` decodes the answer
   and, on `PARSE_ERROR`, resends inside the *same* held exchange, bounded by
   `IDLE_WAKE_RETRIES`, with no added delay so the resend lands in the wake
-  window. This matters most for `on_connect`, whose standby-enable is by
+  window. This matters most for `on_connect`, whose power probe is by
   construction the first frame after a gap. The division of labour: the kit
   retries on timeouts it can see (`confirm(retries=)`); the driver retries on
   reply content only it can decode.
 - **Sometimes the wake is silent.** The TV swallows the first frame and
   answers nothing (seen on a standby power poll about once a day). A *query*
-  that times out is resent once in the same exchange, but only when the TV has
-  been quiet for `IDLE_WAKE_AFTER` seconds (`_last_reply_at`, reset per
-  session). Without that gate every unsupported query, which times out right
-  after another reply, would cost two timeouts. Sets are never resent on
+  that times out is resent once in the same exchange, but only when the line
+  has been quiet for `IDLE_WAKE_AFTER` seconds (`_last_wire_at`: the last frame
+  sent *or* received, reset per session). The receiver sleeps when it hears
+  nothing, so a run of unanswered queries keeps it awake; measuring from the
+  last reply instead turned every timeout after the second in a `refresh()`
+  into a resend. Without the gate every unsupported query, which times out
+  right after another frame, would cost two timeouts. Sets are never resent on
   silence: the command may have landed with only the ack lost, and some sets
   step or toggle.
 - **`on_connect` always ends with `notify()`.** A reconnect to a TV whose
@@ -81,8 +91,9 @@ tests/
 - **`refresh()` is slow on a real set.** 18 functions × a 2 s timeout, and a
   consumer Bravia answers roughly four of them, so a full round costs tens of
   seconds. `on_connect` runs it when the TV is on, which blocks connection
-  setup for that long. Learning the supported set is the fix, and is also the
-  prerequisite for liveness above.
+  setup for that long (a probe-only caller passes `refresh_on_connect=False`).
+  Learning the supported set is the fix, and is also the prerequisite for
+  liveness above.
 
 ## Testing
 

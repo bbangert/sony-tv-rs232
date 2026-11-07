@@ -7,12 +7,15 @@ mapping, the idle-wake resend, the connect handshake, and reconnect."""
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
-from conftest import FakeSonyTV, make_tv, short_ack
+from conftest import FakeSonyTV, NoHandshakeSonyTV, make_tv, short_ack
 from serialkit import CommandTimeoutError, ConnectionLostError
 
 from sony_tv_rs232 import (
+    HEADER_CONTROL,
+    HEADER_INQUIRY,
     AnswerCode,
     Function,
     InputSource,
@@ -145,6 +148,88 @@ async def test_handshake_set_only_when_queries_unanswered(link) -> None:
         await tv.disconnect()
 
 
+def _standby_arms(fake: FakeSonyTV) -> int:
+    return sum(
+        1
+        for p in fake.received
+        if p[0] == HEADER_CONTROL and p[2] == Function.STANDBY_COMMAND.value
+    )
+
+
+async def test_handshake_arms_standby_when_tv_is_on(link) -> None:
+    fake = FakeSonyTV(link, query_data={Function.POWER.value: b"\x01"})
+    tv = make_tv(link, cls=SonyTV, refresh_on_connect=False)
+    await tv.connect()
+    try:
+        assert _standby_arms(fake) == 1
+        await tv.query_power()  # still on: already armed this session
+        assert _standby_arms(fake) == 1
+    finally:
+        await tv.disconnect()
+
+
+async def test_standby_rearmed_when_tv_first_seen_on(link) -> None:
+    """An arm sent while the TV is in standby is not honoured, so the session
+    arms again the first time a power query sees the TV on (turned on with
+    its remote), and only that once."""
+    fake = FakeSonyTV(link, query_data={Function.POWER.value: b"\x00"})
+    tv = make_tv(link, cls=SonyTV)
+    await tv.connect()
+    try:
+        assert _standby_arms(fake) == 1  # best-effort arm in standby
+        fake.query_data[Function.POWER.value] = b"\x01"
+        assert await tv.query_power() is PowerState.ON
+        assert _standby_arms(fake) == 2
+        await tv.query_power()
+        assert _standby_arms(fake) == 2
+    finally:
+        await tv.disconnect()
+
+
+async def test_set_only_tv_gets_best_effort_arm(link) -> None:
+    fake = FakeSonyTV(link, silent_functions={Function.POWER.value})
+    tv = make_tv(link, cls=SonyTV)
+    await tv.connect()
+    try:
+        assert tv.supports_queries is False
+        assert _standby_arms(fake) == 1
+    finally:
+        await tv.disconnect()
+
+
+async def test_refresh_on_connect_false_skips_full_query(link) -> None:
+    fake = FakeSonyTV(
+        link,
+        query_data={
+            Function.POWER.value: b"\x01",
+            Function.VOLUME.value: b"\x01\x28",
+        },
+    )
+    tv = make_tv(link, cls=SonyTV, refresh_on_connect=False)
+    await tv.connect()
+    try:
+        assert tv.state.power is PowerState.ON
+        assert tv.state.volume is None  # no refresh() round
+        queries = [p for p in fake.received if p[0] == HEADER_INQUIRY]
+        assert len(queries) == 1
+    finally:
+        await tv.disconnect()
+
+
+async def test_connect_log_redacts_port_query(link, caplog) -> None:
+    """An esphome:// URL carries the proxy's API key in its query string."""
+    FakeSonyTV(link)
+    tv = NoHandshakeSonyTV(
+        "esphome://proxy.local/?port_name=TTL&key=secret-api-key",
+        connect_factory=link.connect,
+    )
+    with caplog.at_level(logging.DEBUG, logger="sony_tv_rs232"):
+        await tv.connect()
+        await tv.disconnect()
+    assert "esphome://proxy.local/" in caplog.text
+    assert "secret-api-key" not in caplog.text
+
+
 async def test_handshake_power_on_runs_full_query(link) -> None:
     FakeSonyTV(
         link,
@@ -244,9 +329,9 @@ async def test_persistent_parse_error_raises_after_one_retry(link) -> None:
 
 
 async def test_handshake_survives_parse_error_on_first_frame(link) -> None:
-    """The standby-listen enable is the first frame after open, so it is the
-    one a sleeping TV NAKs; a NAK on it must not leave standby listening
-    silently disabled, nor the next probe misread as set-only."""
+    """The power probe is the first frame after open, so it is the one a
+    sleeping TV NAKs; a NAK on it must not misread the TV as set-only, nor
+    skip the standby-listen arm that follows."""
     fake = FakeSonyTV(
         link,
         query_data={Function.POWER.value: b"\x00"},
@@ -255,10 +340,46 @@ async def test_handshake_survives_parse_error_on_first_frame(link) -> None:
     tv = make_tv(link, cls=SonyTV)  # real on_connect
     await tv.connect()
     try:
-        standby = [p for p in fake.received if p[2] == Function.STANDBY_COMMAND.value]
-        assert len(standby) == 2  # NAKed once, then acked
+        power = [p for p in fake.received if p[2] == Function.POWER.value]
+        assert len(power) == 2  # NAKed once, then answered
         assert tv.supports_queries is True  # the power query was not misread
         assert tv.state.power is PowerState.OFF
+        assert _standby_arms(fake) == 1
+    finally:
+        await tv.disconnect()
+
+
+async def test_unanswered_run_does_not_resend_each_query(link) -> None:
+    """Frames sent to the TV keep its receiver awake, so a run of unsupported
+    queries costs one timeout each: the idle gate counts sends, not just
+    replies. Gating on the last reply turned every timeout after the second
+    into a resend, roughly doubling a refresh() against a set that answers
+    few queries."""
+    fake = FakeSonyTV(
+        link,
+        query_data={Function.POWER.value: b"\x01"},
+        silent_functions={
+            Function.VOLUME.value,
+            Function.AUDIO_MUTE.value,
+            Function.INPUT_SELECT.value,
+            Function.SOUND_MODE.value,
+        },
+    )
+    # Two timeouts (0.4 s) outlast the gate, one (0.2 s) does not.
+    tv = make_tv(link, idle_wake_after=0.3)
+    await tv.connect()
+    try:
+        await tv.query_power()
+        for query in (
+            tv.query_volume,
+            tv.query_mute,
+            tv.query_input_source,
+            tv.query_sound_mode,
+        ):
+            with pytest.raises(CommandTimeoutError):
+                await query()
+        queries = [p for p in fake.received if p[0] == HEADER_INQUIRY]
+        assert len(queries) == 5  # power + four, none resent
     finally:
         await tv.disconnect()
 

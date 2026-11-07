@@ -51,6 +51,8 @@ class FakeSonyTV:
     that many writes are NAKed with PARSE_ERROR (the leading bytes were lost
     waking up) before normal dispatch resumes. ``silent_first`` is the silent
     flavour of the same wake: that many writes get no answer at all.
+    Queries for functions in ``silent_functions`` are never answered, as on a
+    model that does not support them.
     """
 
     def __init__(
@@ -60,11 +62,13 @@ class FakeSonyTV:
         query_data: dict[int, bytes] | None = None,
         parse_error_first: int = 0,
         silent_first: int = 0,
+        silent_functions: set[int] | None = None,
     ) -> None:
         self.link = link
         self.query_data = dict(query_data or {})
         self.parse_error_first = parse_error_first
         self.silent_first = silent_first
+        self.silent_functions = set(silent_functions or ())
         self.received: list[bytes] = []
         link.on_write = self._on_write
 
@@ -80,6 +84,8 @@ class FakeSonyTV:
         header = packet[0]
         function = packet[2]
         if header == HEADER_INQUIRY:
+            if function in self.silent_functions:
+                return  # this model does not answer that query
             data = self.query_data.get(function)
             self.link.rx(long_reply(data) if data is not None else short_ack())
         elif header == HEADER_CONTROL:

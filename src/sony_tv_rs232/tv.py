@@ -64,6 +64,12 @@ from .state import TVState
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _redact(port: str) -> str:
+    """Drop a port URL's query string: an esphome:// URL can carry an API key."""
+    return port.split("?", 1)[0]
+
+
 _T = TypeVar("_T")
 
 
@@ -130,13 +136,21 @@ class SonyTV:
         backoff: Backoff | None = None,
         connect_factory: Callable[[], Any] | None = None,
         idle_wake_after: float = IDLE_WAKE_AFTER,
+        refresh_on_connect: bool = True,
     ) -> None:
         self._port = port
         self._baudrate = baudrate
         self._command_timeout = command_timeout
         self._idle_wake_after = idle_wake_after
-        # Loop time of the TV's last reply this session; None until it answers.
-        self._last_reply_at: float | None = None
+        self._refresh_on_connect = refresh_on_connect
+        # Loop time of the last frame on the wire this session, in either
+        # direction; None until the first send.
+        self._last_wire_at: float | None = None
+        # Whether standby listening was armed while the TV was known to be on
+        # this session. Sony only honours the arm when it is sent to a TV that
+        # is on, so an arm sent in standby (or to a set-only TV whose power is
+        # unknown) is best-effort and is repeated once the TV is seen on.
+        self._standby_armed = False
         self.state = TVState()
         self.link = SerialLink(
             connect=connect_factory or self._open_connection,
@@ -239,31 +253,36 @@ class SonyTV:
         _LOGGER.debug("Unsolicited answer dropped: %s", frame.hex(" "))
 
     async def on_connect(self) -> None:
-        """Arm standby listening, then probe query support.
+        """Probe query support, arm standby listening, and repopulate state.
 
         The link calls this on every connection with frames already flowing, so
         repopulating state is owned by the driver rather than the consumer.
         Subscribers always get a state at the end, even when nothing changed:
         a reconnect to an unchanged TV must still cancel the ``None`` that the
         disconnect delivered.
+
+        A TV that answers the power query as on is armed by ``query_power``.
+        Otherwise (in standby, or set-only) the arm is sent best-effort: it is
+        the only chance a set-only TV gets, and a TV in standby is armed again
+        once a later power query sees it on.
         """
-        try:
-            await self.enable_standby_listening()
-        except (CommandTimeoutError, ProtocolError) as err:
-            _LOGGER.debug("Could not enable standby listening: %s", err)
         try:
             power = await self.query_power()
         except (CommandTimeoutError, ProtocolError) as err:
+            power = None
             self._supports_queries = False
             _LOGGER.debug("TV did not answer a power query (%s); set-only mode", err)
         else:
             self._supports_queries = True
-            if power is PowerState.ON:
-                await self.refresh()
+        if power is not PowerState.ON:
+            await self._try_enable_standby_listening()
+        elif self._refresh_on_connect:
+            await self.refresh()
         self.notify()
 
     def on_disconnect(self, exc: Exception | None) -> None:  # noqa: ARG002
-        self._last_reply_at = None  # a new session starts with the TV idle
+        self._last_wire_at = None  # a new session starts with the TV idle
+        self._standby_armed = False
         self._notify_dirty = False  # a pending update must not outrun None
         self._deliver(None)
 
@@ -272,7 +291,7 @@ class SonyTV:
     async def connect(self) -> None:
         """Open the serial connection and run the handshake."""
         await self.link.start()
-        _LOGGER.info("Connected to Sony TV on %s", self._port)
+        _LOGGER.info("Connected to Sony TV on %s", _redact(self._port))
 
     async def disconnect(self) -> None:
         """Close the serial connection (no reconnect)."""
@@ -312,6 +331,10 @@ class SonyTV:
     async def query_power(self) -> PowerState:
         """Query the TV's power state (community query format)."""
         power: PowerState = await self._query(Function.POWER)
+        if power is PowerState.ON and not self._standby_armed:
+            # Sony honours the arm only while the TV is on; this is the first
+            # moment this session it is known to be.
+            self._standby_armed = await self._try_enable_standby_listening()
         return power
 
     async def enable_standby_listening(self) -> None:
@@ -321,6 +344,15 @@ class SonyTV:
         reset or the standby command is disabled.
         """
         await self._set(Function.STANDBY_COMMAND, bytes([0x01]))
+
+    async def _try_enable_standby_listening(self) -> bool:
+        """Arm standby listening, reporting instead of raising a failure."""
+        try:
+            await self.enable_standby_listening()
+        except (CommandTimeoutError, ProtocolError) as err:
+            _LOGGER.debug("Could not enable standby listening: %s", err)
+            return False
+        return True
 
     async def disable_standby_listening(self) -> None:
         """Stop the TV from listening for Power ON while in standby."""
@@ -514,9 +546,9 @@ class SonyTV:
         same packet.
 
         Silence is only resent when ``resend_on_silence`` is set (queries,
-        which have no side effect) and the TV has been quiet for
+        which have no side effect) and the line has been quiet for
         ``idle_wake_after`` seconds: a query the model does not support times
-        out right after another reply and must not cost a second timeout. A
+        out right after another frame and must not cost a second timeout. A
         persistent PARSE_ERROR (a genuinely malformed packet) or silence still
         surfaces after the one resend.
         """
@@ -525,6 +557,7 @@ class SonyTV:
             while True:
                 after_idle = self._idle()
                 await exchange.send(packet)
+                self._mark_wire()
                 try:
                     frame = await exchange.next(timeout=self._command_timeout)
                 except CommandTimeoutError:
@@ -535,7 +568,7 @@ class SonyTV:
                         )
                         continue
                     raise
-                self._last_reply_at = asyncio.get_running_loop().time()
+                self._mark_wire()
                 answer = parse_answer(frame)
                 if (
                     answer.code is not AnswerCode.PARSE_ERROR
@@ -547,11 +580,20 @@ class SonyTV:
                     "TV reported PARSE_ERROR (first frame after idle); resending"
                 )
 
+    def _mark_wire(self) -> None:
+        """Record a frame on the wire (either direction) for the idle gate."""
+        self._last_wire_at = asyncio.get_running_loop().time()
+
     def _idle(self) -> bool:
-        """Whether the TV has been quiet long enough to have fallen asleep."""
-        if self._last_reply_at is None:
+        """Whether the line has been quiet long enough for the TV to sleep.
+
+        The receiver sleeps when it hears nothing, so a frame sent to it counts
+        as much as one it sends back: a run of unanswered queries keeps it
+        awake, and must not turn every timeout after the first into a resend.
+        """
+        if self._last_wire_at is None:
             return True
-        quiet = asyncio.get_running_loop().time() - self._last_reply_at
+        quiet = asyncio.get_running_loop().time() - self._last_wire_at
         return quiet >= self._idle_wake_after
 
     async def _set(self, function: Function, data: bytes) -> Answer:

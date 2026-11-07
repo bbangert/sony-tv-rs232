@@ -14,11 +14,12 @@ INTER_COMMAND_DELAY = 0.5  # Sony spec mandates >= 500ms between commands
 IDLE_WAKE_RETRIES = 1
 
 # Some wakes are silent instead: the TV swallows the first frame and answers
-# nothing. A query that goes unanswered after this many seconds without a reply
-# is resent once (within IDLE_WAKE_RETRIES). The gate keeps the resend to
-# wake-ups: a query the model simply does not support times out right after
-# another reply, and must not cost a second timeout.
-IDLE_WAKE_AFTER = 5.0  # seconds since the TV's last reply
+# nothing. A query that goes unanswered after this many seconds without any
+# frame on the wire (sent or received) is resent once (within
+# IDLE_WAKE_RETRIES). The gate keeps the resend to wake-ups: a query the model
+# simply does not support times out right after another frame, and must not
+# cost a second timeout.
+IDLE_WAKE_AFTER = 5.0  # seconds since the last frame on the wire
 
 # Packet header bytes
 HEADER_CONTROL = 0x8C  # host -> TV: Set / Write request
